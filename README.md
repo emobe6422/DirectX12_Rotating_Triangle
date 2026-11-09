@@ -1,3 +1,3 @@
-Following a tutorial to make a rotating triangle in Dx12 with D3D. Spent the last few days learning as much about graphics engineering/programming from scratch (not exactly I have a pretty decent GPU background).
+Following a tutorial to make a rotating triangle in DX12 with D3D. Spent the last few days learning as much about graphics engineering/programming from scratch (not exactly I have a pretty decent GPU background).
 
 Cheers.
