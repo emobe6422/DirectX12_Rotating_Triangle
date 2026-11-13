@@ -2,4 +2,6 @@ Following a tutorial to make a rotating triangle in DX12 with D3D. Spent the las
 
 Left comments to document my learning (in addition to the undocumented textbook reading I did)
 
+UPDATE: Got the 2nd interview at activision so I will be wrapping this project up by sunday at the latest! Took a hiatus
+
 Cheers.
