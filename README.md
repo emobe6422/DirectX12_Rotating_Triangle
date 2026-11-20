@@ -6,4 +6,6 @@ UPDATE: FINISHED! A lot of the code doesnt feel intuitive jsut yet and a lot of 
 
 UPDATE: NSight was having a few issues and I dont yet understand the code well enough to debug it on my own. Claude was use to fix some of the issues, denoted with "FIX"
 
+Used Claude to make TERRIBLE versions of the hlsl and main.cpp to stress out the scene as much as possible so I can analyze them in nsight to actually learn.
+
 Cheers.
