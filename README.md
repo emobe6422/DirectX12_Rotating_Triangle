@@ -4,4 +4,6 @@ Left comments to document my learning (in addition to the undocumented textbook 
 
 UPDATE: FINISHED! A lot of the code doesnt feel intuitive jsut yet and a lot of it i just copy and pasted towards the end to finish up so I can at least get used to using the Nsight profiler tool before interview. It's crazy to see the thing actually spin.
 
+UPDATE: NSight was having a few issues and I dont yet understand the code well enough to debug it on my own. Claude was use to fix some of the issues, denoted with "FIX"
+
 Cheers.
