@@ -1,0 +1,466 @@
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+#include <cwchar> // PROFILING: wcsstr for reading the variant name from the command line
+using Microsoft::WRL::ComPtr;
+
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+
+// PROFILING: alpha_blend = true turns on standard transparency (src*a + dest*(1-a)),
+// used by the OVERDRAW variant so every layer has to read-modify-write the render target.
+void set_blend_state(D3D12_BLEND_DESC& blend_desc, bool alpha_blend = false) {
+    blend_desc = {};
+
+    blend_desc.AlphaToCoverageEnable = FALSE;
+    blend_desc.IndependentBlendEnable = FALSE;
+
+    D3D12_RENDER_TARGET_BLEND_DESC default_render_target_blend_desc = {};
+    default_render_target_blend_desc.BlendEnable = alpha_blend ? TRUE : FALSE;
+    default_render_target_blend_desc.LogicOpEnable = FALSE;
+    default_render_target_blend_desc.SrcBlend = alpha_blend ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ONE;
+    default_render_target_blend_desc.DestBlend = alpha_blend ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_ZERO;
+    default_render_target_blend_desc.BlendOp = D3D12_BLEND_OP_ADD;
+    default_render_target_blend_desc.SrcBlendAlpha = D3D12_BLEND_ONE;
+    default_render_target_blend_desc.DestBlendAlpha = D3D12_BLEND_ZERO;
+    default_render_target_blend_desc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    default_render_target_blend_desc.LogicOp = D3D12_LOGIC_OP_NOOP;
+    default_render_target_blend_desc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+        blend_desc.RenderTarget[i] = default_render_target_blend_desc;
+    }
+}
+
+void set_rasterizer_state(D3D12_RASTERIZER_DESC& rasterizer_desc) {
+    rasterizer_desc = {};
+
+    rasterizer_desc.FillMode = D3D12_FILL_MODE_SOLID;
+    // PROFILING: no culling, so the full-screen triangle can never be discarded by its winding order
+    rasterizer_desc.CullMode = D3D12_CULL_MODE_NONE;
+    rasterizer_desc.FrontCounterClockwise = FALSE;
+    rasterizer_desc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+    rasterizer_desc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    rasterizer_desc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    rasterizer_desc.DepthClipEnable = TRUE;
+    rasterizer_desc.MultisampleEnable = FALSE;
+    rasterizer_desc.AntialiasedLineEnable = FALSE;
+    rasterizer_desc.ForcedSampleCount = 0;
+    rasterizer_desc.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+}
+
+void set_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC& depth_stencil_desc) {
+    depth_stencil_desc = {};
+
+    depth_stencil_desc.DepthEnable = FALSE;
+    depth_stencil_desc.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    depth_stencil_desc.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+
+    depth_stencil_desc.StencilEnable = FALSE;
+    depth_stencil_desc.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    depth_stencil_desc.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+
+    depth_stencil_desc.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    depth_stencil_desc.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    depth_stencil_desc.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    depth_stencil_desc.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+
+    depth_stencil_desc.BackFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    depth_stencil_desc.BackFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    depth_stencil_desc.BackFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    depth_stencil_desc.BackFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+}
+
+LRESULT CALLBACK WindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_DESTROY:
+    {
+        PostQuitMessage(0);
+        return 0;
+    }
+    break;
+    }
+
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    // PROFILING: bigger render target = more pixels = pixel work dominates the frame
+    const int width = 1920;
+    const int height = 1080;
+
+    // PROFILING: pick the shader variant from the command line, e.g. "DX12_Triangle.exe ALU_HEAVY".
+    // In Nsight, type the variant name into the activity's "Command Line Arguments" field.
+    const char* variant_macro = "VARIANT_BASELINE";
+    bool overdraw = false;
+    if      (wcsstr(pCmdLine, L"ALU_HEAVY"))    variant_macro = "VARIANT_ALU_HEAVY";
+    else if (wcsstr(pCmdLine, L"DIVERGENT"))    variant_macro = "VARIANT_DIVERGENT";
+    else if (wcsstr(pCmdLine, L"COHERENT"))     variant_macro = "VARIANT_COHERENT";
+    else if (wcsstr(pCmdLine, L"REG_PRESSURE")) variant_macro = "VARIANT_REG_PRESSURE";
+    else if (wcsstr(pCmdLine, L"OVERDRAW"))     { variant_macro = "VARIANT_OVERDRAW"; overdraw = true; }
+
+    // Passed to D3DCompileFromFile; acts like "#define VARIANT_xxx 1" at the top of shader.hlsl.
+    // The array must end with a {nullptr, nullptr} entry.
+    D3D_SHADER_MACRO shader_defines[] = { { variant_macro, "1" }, { nullptr, nullptr } };
+
+    const UINT instance_count = overdraw ? 32 : 1; // OVERDRAW = 32 stacked full-screen layers
+
+    // Register a simple window class
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"DirectX12Triangle";
+    RegisterClass(&wc);
+
+    // Create a window
+    HWND hwnd = CreateWindow(wc.lpszClassName, L"DirectX 12 Triangle", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, width, height, nullptr, nullptr, hInstance, nullptr);
+    ShowWindow(hwnd, nCmdShow);
+    SetWindowTextA(hwnd, variant_macro); // PROFILING: window title shows which variant is running
+
+    // FIX: enable the D3D12 debug layer in Debug builds only. It reports API misuse
+    // (like a missing resource barrier) in Visual Studio's Output window.
+    // Profile Release builds in Nsight, where this block compiles out.
+#if defined(_DEBUG)
+    {
+        ID3D12Debug* debug_controller = nullptr;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug_controller)))) {
+            debug_controller->EnableDebugLayer();
+            debug_controller->Release();
+        }
+    }
+#endif
+
+    /**
+    * Make the device - CPU's representation of a SINGLE GPU
+    * (unless specified w/ the first nullptr param)
+    *
+    * Create a pointer to the device and initialize it to null. Choose the miniumum
+    * feature capabilities with the 2nd param and use the third param to ask for an object
+    * by interface ID (IID). &Device is type void** and i dont totally get why.
+    *
+    * HRESULT hr allows you to check if makign the device was successful or not
+    */
+    ID3D12Device *device = nullptr;
+    HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+
+    /**
+    * Once device is created, we can use it as a factory to create other
+    * things like the command queue
+    *
+    * When we create a command queue, we need to initialize it to zero using {}
+    */
+    ID3D12CommandQueue* command_queue = nullptr;
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; // for typical grpahics use direct
+    queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE; //nothing special
+    hr = device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&command_queue));
+
+    /**
+    * Command Allocator - Memory for storing command lists/ No struct exists. Need to wipe memory
+    * in the allocator after every frame, hence hr = command_allocator->Reset();
+    */
+    ID3D12CommandAllocator *command_allocator = nullptr;
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator));
+    hr = command_allocator->Reset();
+
+
+    /**
+    * Command List - contains everyhting the GPU should do
+    *
+    * 0 - single GPU
+    *
+    * DIRECT - Allocator, List and Queue need the same type
+    *
+    * command_allocator - memory recorded into
+    *
+    * nullptr - whats a PSO?
+    *
+    * Interface ID and where to write new list
+    */
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, command_allocator, nullptr, IID_PPV_ARGS(&command_list));
+    hr = command_list->Close();
+
+    /**
+    * Swapchain - front buffer, back buffer
+    * The back buffer image works with the z depth and
+    * depth buffer to determine which pixel to dislay,
+    * which isnt relevant here since only one object (triangle)
+    *
+    * IDXGI - DirectX Graphics Infra - deals with system and
+    * screen instead of rendering like D3D12
+    *
+    * swap_chain_desc.SampleDesc.Count = 1; for multisampling anti aliasing (MSAA). 1 means no MSAA
+    */
+    IDXGIFactory4 *factory = nullptr;
+    hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    DXGI_SWAP_CHAIN_DESC swap_chain_desc = {}; //zero-out the struct and instantiate what we care about only
+    swap_chain_desc.BufferCount = 2;
+    swap_chain_desc.BufferDesc.Width = width;
+    swap_chain_desc.BufferDesc.Height = height;
+    swap_chain_desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    swap_chain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swap_chain_desc.OutputWindow = hwnd;
+    swap_chain_desc.SampleDesc.Count = 1;
+    swap_chain_desc.Windowed = TRUE;
+
+    IDXGISwapChain *temp_swap_chain = nullptr;
+    hr = factory->CreateSwapChain(command_queue, &swap_chain_desc, &temp_swap_chain);
+
+    IDXGISwapChain3* swap_chain = {};
+    hr = temp_swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain));
+    temp_swap_chain->Release();
+    temp_swap_chain = nullptr;
+
+    /**
+    * Memory head that stores RTVs(render target views). RTVs are a subset
+    * of descriptors, hence we have a descriptor heap.
+    *
+    * A descriptor explains how to interpret resources like buffers
+    */
+    ID3D12DescriptorHeap* rtv_heap = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
+    rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtv_heap_desc.NumDescriptors = 2;
+    hr = device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&rtv_heap));
+
+    ID3D12Resource *render_targets[2];
+
+    /**
+    * Yeah idk.
+    */
+    UINT rtv_increment_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle(rtv_heap->GetCPUDescriptorHandleForHeapStart());
+        for (UINT i = 0; i < 2; i++) {
+            hr = swap_chain->GetBuffer(i, IID_PPV_ARGS(&render_targets[i]));
+
+            device->CreateRenderTargetView(render_targets[i], nullptr, rtv_handle);
+            rtv_handle.ptr += rtv_increment_size;
+        }
+    }
+
+    /**
+    * Fence exists to ensure the GPU and CPU dont touch memory at the same time
+    * CPU stops when GPU writes data
+    */
+    ID3D12Fence* fence = nullptr; //GPU-side
+    UINT64 fence_value = 0; //CPU-side
+    hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    HANDLE fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr); //For windows
+
+    //huh>??????
+    D3D12_ROOT_PARAMETER root_parameters[1] = {};
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_parameters[0].Constants.Num32BitValues = 1;
+    root_parameters[0].Constants.ShaderRegister = 0;
+    root_parameters[0].Constants.RegisterSpace = 0;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    ID3D12RootSignature* root_signature = nullptr;
+    D3D12_ROOT_SIGNATURE_DESC root_signature_desc = {};
+    root_signature_desc.NumParameters = _countof(root_parameters);
+    root_signature_desc.pParameters = root_parameters;
+    root_signature_desc.NumStaticSamplers = 0;
+    root_signature_desc.pStaticSamplers = nullptr;
+    root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ID3DBlob* signature_blob = nullptr;
+    ID3DBlob* error_blob = nullptr;
+    hr = D3D12SerializeRootSignature(&root_signature_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature_blob, &error_blob);
+    hr = device->CreateRootSignature(0, signature_blob->GetBufferPointer(), signature_blob->GetBufferSize(), IID_PPV_ARGS(&root_signature));
+
+    if (signature_blob) {
+        signature_blob->Release();
+        signature_blob = nullptr;
+    }
+    if (error_blob) {
+        error_blob->Release();
+        error_blob = nullptr;
+    }
+
+    //compile shaders
+    // FIX: D3DCOMPILE_DEBUG embeds debug info so Nsight can map GPU code back to HLSL lines
+    // (this is what the "Missing Debug Info" warning was about). Optimizations stay ON,
+    // so profiling numbers stay realistic. Never add D3DCOMPILE_SKIP_OPTIMIZATION when profiling.
+    // FIX: also capture compile errors and stop with a message box instead of failing silently
+    // (a missing shader.hlsl used to leave a white, frozen window).
+    UINT compile_flags = D3DCOMPILE_DEBUG | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    ID3DBlob* vertex_shader = nullptr;
+    ID3DBlob* pixel_shader = nullptr;
+    ID3DBlob* shader_error_blob = nullptr;
+
+    // PROFILING: shader_defines selects the variant (2nd argument)
+    hr = D3DCompileFromFile(L"shader.hlsl", shader_defines, nullptr, "VSMain", "vs_5_0", compile_flags, 0, &vertex_shader, &shader_error_blob);
+    if (FAILED(hr)) {
+        MessageBoxA(nullptr,
+            shader_error_blob ? (char*)shader_error_blob->GetBufferPointer() : "shader.hlsl not found (check the working directory)",
+            "Vertex shader error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    hr = D3DCompileFromFile(L"shader.hlsl", shader_defines, nullptr, "PSMain", "ps_5_0", compile_flags, 0, &pixel_shader, &shader_error_blob);
+    if (FAILED(hr)) {
+        MessageBoxA(nullptr,
+            shader_error_blob ? (char*)shader_error_blob->GetBufferPointer() : "shader.hlsl not found (check the working directory)",
+            "Pixel shader error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    /**
+    * a gpu software bundle of immutable and precompiled states.
+    * Shaders, rasterizers, depth stencil, etc.
+    */
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
+    pso_desc.pRootSignature = root_signature;
+    pso_desc.VS.pShaderBytecode = vertex_shader->GetBufferPointer();
+    pso_desc.VS.BytecodeLength = vertex_shader->GetBufferSize();
+    pso_desc.PS.pShaderBytecode = pixel_shader->GetBufferPointer();
+    pso_desc.PS.BytecodeLength = pixel_shader->GetBufferSize();
+    set_blend_state(pso_desc.BlendState, overdraw); // PROFILING: blending on only for OVERDRAW
+    pso_desc.SampleMask = UINT_MAX;
+    set_rasterizer_state(pso_desc.RasterizerState);
+    set_depth_stencil_state(pso_desc.DepthStencilState);
+    pso_desc.InputLayout.pInputElementDescs = nullptr;
+    pso_desc.InputLayout.NumElements = 0;
+    pso_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+    pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pso_desc.SampleDesc.Count = 1;
+    pso_desc.SampleDesc.Quality = 0;
+
+    ID3D12PipelineState* pipeline_state = nullptr;
+    hr = device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pipeline_state));
+    // FIX: a failed PSO would otherwise hang the frame loop later
+    if (FAILED(hr)) {
+        MessageBoxA(nullptr, "CreateGraphicsPipelineState failed", "PSO error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    vertex_shader->Release();
+    vertex_shader = nullptr;
+    pixel_shader->Release();
+    pixel_shader = nullptr;
+
+    unsigned int triangle_angle = 0;
+
+    bool running = true;
+    while (running) {
+        MSG msg = {};
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        // FIX: the break above only leaves the message loop; without this, one extra
+        // frame was recorded and submitted after the window was already destroyed
+        if (!running) {
+            break;
+        }
+
+        //Clear everything out first
+        hr = command_allocator->Reset();
+        hr = command_list->Reset(command_allocator, nullptr);
+
+        UINT back_buffer_index = swap_chain->GetCurrentBackBufferIndex();
+
+        {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrier.Transition.pResource = render_targets[back_buffer_index];
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            command_list->ResourceBarrier(1, &barrier);
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtv_handle.ptr += back_buffer_index * rtv_increment_size;
+
+        // Clear the render target
+        float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
+        command_list->ClearRenderTargetView(rtv_handle, clearColor, 0, nullptr);
+
+        // Set viewport and scissor
+        D3D12_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f };
+        D3D12_RECT scissor_rect = { 0, 0, width, height };
+        command_list->RSSetViewports(1, &viewport);
+        command_list->RSSetScissorRects(1, &scissor_rect);
+
+        command_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+        command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        command_list->SetGraphicsRootSignature(root_signature);
+        command_list->SetPipelineState(pipeline_state);
+
+        // Draw the triangle
+        command_list->SetGraphicsRoot32BitConstant(0, triangle_angle, 0);
+        // PROFILING: 3 vertices = one full-screen triangle; instance_count = 32 layers for OVERDRAW
+        command_list->DrawInstanced(3, instance_count, 0, 0);
+
+        // FIX (the main bug): transition the back buffer back to PRESENT before presenting.
+        // Every frame must go PRESENT -> RENDER_TARGET -> (draw) -> PRESENT.
+        // Without this, Present() was handed a resource still in the RENDER_TARGET state:
+        // the debug layer flags it, and on some GPUs it shows garbage or corruption.
+        {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrier.Transition.pResource = render_targets[back_buffer_index];
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            command_list->ResourceBarrier(1, &barrier);
+        }
+
+        hr = command_list->Close();
+
+        ID3D12CommandList* command_lists[] = { command_list };
+        command_queue->ExecuteCommandLists(1, command_lists);
+
+        // Present(1, 0) = vsync ON (frame time locked to the monitor's refresh).
+        // For profiling, Present(0, 0) shows the GPU's real speed.
+        // PROFILING: vsync OFF so frame time reflects real GPU cost, not the monitor's refresh rate
+        hr = swap_chain->Present(0, 0);
+
+        // Wait on the CPU for the GPU frame to finish
+        const UINT64 current_fence_value = ++fence_value;
+        hr = command_queue->Signal(fence, current_fence_value);
+
+        if (fence->GetCompletedValue() < current_fence_value) {
+            hr = fence->SetEventOnCompletion(current_fence_value, fence_event);
+            WaitForSingleObject(fence_event, INFINITE);
+        }
+
+        triangle_angle++;
+    }
+
+    // FIX: shut down cleanly. The fence wait at the end of the last frame already
+    // guarantees the GPU is idle, so it's safe to release everything here.
+    CloseHandle(fence_event);
+    if (shader_error_blob) shader_error_blob->Release();
+    pipeline_state->Release();
+    root_signature->Release();
+    fence->Release();
+    render_targets[0]->Release();
+    render_targets[1]->Release();
+    rtv_heap->Release();
+    swap_chain->Release();
+    factory->Release();
+    command_list->Release();
+    command_allocator->Release();
+    command_queue->Release();
+    device->Release();
+
+    return 0;
+}
