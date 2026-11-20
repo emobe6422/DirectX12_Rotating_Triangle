@@ -2,6 +2,6 @@ Following a tutorial to make a rotating triangle in DX12 with D3D. Spent the las
 
 Left comments to document my learning (in addition to the undocumented textbook reading I did)
 
-UPDATE: FINISHED! A lot of the code doesnt feel intuitive jsut yet and a lot of it i just copy and pasted towards the end to finish up so I can at least get used to using the Nsight profiler tool before interview.
+UPDATE: FINISHED! A lot of the code doesnt feel intuitive jsut yet and a lot of it i just copy and pasted towards the end to finish up so I can at least get used to using the Nsight profiler tool before interview. It's crazy to see the thing actually spin.
 
 Cheers.
